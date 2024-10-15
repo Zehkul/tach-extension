@@ -513,11 +513,14 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
      * Fetches the "url" of each page from the chapter
      * **/
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET("$apiUrl/${chapter.url}", headersBuilder().build())
+        // remove potential _<part> chapter salt
+        val realID = chapter.url.substringBefore("_")
+        return GET("$apiUrl/$realID", headersBuilder().build())
     }
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        val chapterId = chapter.url
+        // remove potential _<part> chapter salt
+        val realID = chapter.url.substringBefore("_")
         val numPages = chapter.scanlator?.replace(" pages", "")?.toInt()
         val numPages2 = "$numPages".toInt() - 1
         val pages = mutableListOf<Page>()
@@ -525,7 +528,7 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
             pages.add(
                 Page(
                     index = i,
-                    imageUrl = "$apiUrl/Reader/image?chapterId=$chapterId&page=$i&extractPdf=true&apiKey=$apiKey",
+                    imageUrl = "$apiUrl/Reader/image?chapterId=$realID&page=$i&extractPdf=true&apiKey=$apiKey",
                 ),
             )
         }
