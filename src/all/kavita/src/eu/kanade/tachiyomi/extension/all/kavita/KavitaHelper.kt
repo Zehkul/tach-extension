@@ -426,7 +426,7 @@ class KavitaHelper {
             if (chapter.fileCount > 1 &&
                 (type == ChapterType.Regular || type == ChapterType.Chapter || type == ChapterType.Issue)
             ) {
-                chapter_number += 0.001f * chapter.fileCount
+                chapter_number += 0.001f * chapter.fileCount.coerceAtMost(99)
                 url = "$url?split=${chapter.fileCount}"
             }
 
