@@ -5,7 +5,7 @@ object KavitaConstants {
     const val UNNUMBERED_VOLUME_STR = "-100000"
     const val SPECIAL_NUMBER = 100_000
     const val VOLUME_NUMBER_OFFSET = 10000f
-    const val SPECIAL_NUMBER_OFFSET = 10000000000f
+    const val UNNUMBERED = -2f
 
     const val CUSTOM_SOURCE_NAME_PREF = "customSourceName"
     const val NO_SMART_FILTER_SELECTED = "No smart filter loaded"
