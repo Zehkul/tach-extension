@@ -71,6 +71,29 @@ jobs:
         run: |
           ./gradlew $(echo '${{ toJson(matrix.chunk.modules) }}' | jq -r 'join(" ")')
 
+      # Same APKs this job just produced — not a separate rebuild. Visible on the
+      # workflow run under Artifacts; name includes PR number for easy matching.
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kavita-debug-pr${{ github.event.pull_request.number }}
+          path: "**/*.apk"
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize uploaded APKs
+        run: |
+          {
+            echo "### Debug APKs (PR #${{ github.event.pull_request.number }})"
+            echo
+            echo "Built from \`${{ github.event.pull_request.head.sha }}\` by this workflow run."
+            echo "Download from the **Artifacts** section of this run (not a manual rebuild)."
+            echo
+            echo '```'
+            find . -name '*.apk' -type f -printf '%p (%s bytes)\n' | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # JVM unit tests for modules that ship them (currently Kavita).
   # Independent of the APK matrix so a pure test change still gates the PR.
   unit-test:
