@@ -1,9 +1,10 @@
-name: Create Release on Merge
+name: Create Release on Version Bump
 
 on:
   push:
     branches:
       - master
+      - main
   workflow_dispatch:
 
 jobs:
@@ -14,175 +15,244 @@ jobs:
       pull-requests: read
 
     steps:
-      - name: Checkout repo branch
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Publish a GitHub Release only when extVersionCode actually increased.
+      # Fail closed if the previous value cannot be established.
+      - name: Detect extVersionCode bump
+        id: version_check
+        run: |
+          set -euo pipefail
+          GRADLE="src/all/kavita/build.gradle"
+          if [ ! -f "$GRADLE" ]; then
+            echo "❌ $GRADLE not found"
+            exit 1
+          fi
+
+          CURRENT=$(grep -E '^\s*extVersionCode\s*=' "$GRADLE" | head -1 | grep -oE '[0-9]+' || true)
+          if [ -z "$CURRENT" ]; then
+            echo "❌ Could not read extVersionCode from $GRADLE"
+            exit 1
+          fi
+          echo "current_code=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current extVersionCode = $CURRENT"
+
+          # Prefer the parent of this push; fall back to HEAD~1 for workflow_dispatch.
+          BEFORE_SHA="${{ github.event.before }}"
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            BEFORE_SHA="$(git rev-parse HEAD~1 2>/dev/null || true)"
+          fi
+
+          PREV=""
+          if [ -n "$BEFORE_SHA" ] && git cat-file -e "${BEFORE_SHA}:${GRADLE}" 2>/dev/null; then
+            PREV=$(git show "${BEFORE_SHA}:${GRADLE}" | grep -E '^\s*extVersionCode\s*=' | head -1 | grep -oE '[0-9]+' || true)
+          fi
+
+          echo "previous_code=${PREV:-none}" >> "$GITHUB_OUTPUT"
+          echo "Previous extVersionCode = ${PREV:-<unknown>}"
+
+          # Fail closed: only release when we can prove CURRENT > PREV.
+          if [ -z "$PREV" ]; then
+            echo "⏭️  Previous extVersionCode unknown — skipping release (fail closed)."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          elif [ "$CURRENT" -le "$PREV" ]; then
+            echo "⏭️  extVersionCode did not increase ($PREV → $CURRENT). Skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ extVersionCode bumped ($PREV → $CURRENT). Will create release."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo branch (APKs live here)
+        if: steps.version_check.outputs.should_release == 'true'
         uses: actions/checkout@v4
         with:
           ref: repo
           fetch-depth: 0
-
-      # Get the merged PR info
-      - name: Get PR information
-        id: pr_info
-        run: |
-          # Fetch and checkout master to analyze history
-          git fetch origin master
-          git checkout -B master origin/master
-          
-          # Initialize variables
-          FOUND_PR=false
-          
-          # Get the last 10 merge commits
-          MERGE_COMMITS=$(git log --merges --format='%H' -n 10)
-          
-          for COMMIT in $MERGE_COMMITS; do
-            # Extract PR number
-            PR_NUMBER=$(git show --format=%B -s $COMMIT | grep -oP 'Merge pull request #\K\d+' || true)
-          
-            # Fallback: Try to match squash merge pattern "Title (#123)"
-            if [ -z "$PR_NUMBER" ]; then
-               PR_NUMBER=$(git show --format=%B -s $COMMIT | grep -oP '\(#\K\d+(?=\))' || true)
-            fi
-          
-            if [ -n "$PR_NUMBER" ]; then
-              echo "Checking PR #$PR_NUMBER..."
-              PR_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER)
-          
-              PR_TITLE=$(echo "$PR_JSON" | jq -r .title)
-          
-              # Check if title matches version pattern
-              if [[ "$PR_TITLE" == *"1.4."* ]]; then
-                 echo "✅ Found Release PR: #$PR_NUMBER - $PR_TITLE"
-                 echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
-                 echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
-          
-                 PR_AUTHOR=$(echo "$PR_JSON" | jq -r .user.login)
-                 echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
-          
-                 # Check first-time contributor
-                 CONTRIBUTOR_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                   https://api.github.com/repos/${{ github.repository }}/contributors/$PR_AUTHOR)
-                 CONTRIBUTIONS=$(echo "$CONTRIBUTOR_JSON" | jq -r .contributions)
-                 if [ "$CONTRIBUTIONS" = "1" ]; then
-                   echo "is_first_contributor=true" >> $GITHUB_OUTPUT
-                 fi
-          
-                 # Get PR body safely
-                 PR_BODY=$(echo "$PR_JSON" | jq -r .body)
-                 {
-                   echo "pr_body<<EOF"
-                   echo "$PR_BODY"
-                   echo "EOF"
-                 } >> $GITHUB_OUTPUT
-          
-                 FOUND_PR=true
-                 break
-              fi
-            fi
-          done
-          
-          if [ "$FOUND_PR" = "false" ]; then
-            echo "⚠️ No recent PR found matching '1.4.*'."
-          fi
-
-      # \Switch back to the 'repo' branch where APKs are stored
-      - name: Switch back to repo branch
-        run: |
-          echo "Switching git context back to 'repo' branch..."
-          git checkout repo
+          path: repo-branch
 
       - name: Find APK and extract version
+        if: steps.version_check.outputs.should_release == 'true'
         id: apk_info
         run: |
-          # Find the Kavita APK
-          APK_PATH=$(find ./apk -name "tachiyomi-all.kavita-*.apk" -type f | head -n 1)
-          
+          set -euo pipefail
+          APK_PATH=$(find repo-branch/apk -name "tachiyomi-all.kavita-*.apk" -type f 2>/dev/null | head -n 1 || true)
           if [ -z "$APK_PATH" ]; then
-            echo "❌ No Kavita APK found in ./apk folder!"
-            echo "Current directory contents:"
-            ls -R
+            APK_PATH=$(find repo-branch -name "tachiyomi-all.kavita-*.apk" -type f 2>/dev/null | head -n 1 || true)
+          fi
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ No Kavita APK found under repo-branch/"
+            ls -laR repo-branch || true
             exit 1
           fi
-          
-          APK_FILENAME=$(basename "$APK_PATH")
-          # Extract version (e.g., v1.4.22)
-          VERSION=$(echo "$APK_FILENAME" | grep -oP 'v\d+\.\d+\.\d+')
-          
-          if [ -z "$VERSION" ]; then
-             echo "❌ Could not determine version from filename: $APK_FILENAME"
-             exit 1
-          fi
-          
-          echo "Found APK: $APK_PATH"
-          echo "Detected Version: $VERSION"
-          
-          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      # Check if release already exists to prevent duplicates
-      - name: Check if release exists
+          APK_FILENAME=$(basename "$APK_PATH")
+          # Version-agnostic: any vMAJOR.MINOR.PATCH in the APK name.
+          VERSION=$(echo "$APK_FILENAME" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "❌ Could not parse version from: $APK_FILENAME"
+            exit 1
+          fi
+
+          echo "Found APK: $APK_PATH"
+          echo "Detected version tag: $VERSION"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        if: steps.version_check.outputs.should_release == 'true'
         id: check_release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.apk_info.outputs.version }}"
-          echo "Checking if release $VERSION already exists..."
-          
           if gh release view "$VERSION" > /dev/null 2>&1; then
-            echo "⚠️ Release $VERSION already exists! Skipping creation."
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "⚠️  Release $VERSION already exists — skipping creation."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "✅ Release $VERSION does not exist. Proceeding."
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✅ Release $VERSION does not exist."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Get changelog
-        if: steps.check_release.outputs.exists == 'false'
+      # Release boundary = consecutive extVersionCode bumps.
+      # Notes = bodies of every PR merged since the previous bump (inclusive of
+      # the bump PR; exclusive of the prior bump). If every PR bumps the code,
+      # that is one PR per release; if several land without a bump, the next
+      # bump's release absorbs them all.
+      - name: Build release notes from PRs since previous version bump
+        if: steps.version_check.outputs.should_release == 'true' && steps.check_release.outputs.exists == 'false'
+        id: notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          GRADLE="src/all/kavita/build.gradle"
+
+          # Commits that touched the version file, newest first.
+          # Index 0 = this bump; index 1 = previous bump (range start).
+          mapfile -t BUMP_COMMITS < <(git log --pretty=%H -- "$GRADLE")
+          THIS_BUMP="${BUMP_COMMITS[0]:-}"
+          PREV_BUMP="${BUMP_COMMITS[1]:-}"
+
+          if [ -z "$THIS_BUMP" ]; then
+            echo "❌ Could not locate the commit that changed $GRADLE"
+            exit 1
+          fi
+
+          if [ -n "$PREV_BUMP" ]; then
+            RANGE="${PREV_BUMP}..HEAD"
+            echo "Release range: $PREV_BUMP (exclusive) .. HEAD"
+          else
+            # First-ever bump in history: take a bounded recent window.
+            RANGE="HEAD~50..HEAD"
+            echo "No previous bump commit found; using bounded range $RANGE"
+          fi
+
+          # Collect unique PR numbers from merge commits and squash subjects in range.
+          PR_NUMBERS=$(
+            {
+              git log "$RANGE" --merges --pretty=%B 2>/dev/null \
+                | grep -oE 'Merge pull request #[0-9]+' \
+                | grep -oE '[0-9]+' || true
+              git log "$RANGE" --pretty=%s 2>/dev/null \
+                | grep -oE '\(#[0-9]+\)' \
+                | grep -oE '[0-9]+' || true
+            } | sort -n -u
+          )
+
+          echo "PRs in range: $(echo $PR_NUMBERS | tr '\n' ' ')"
+
+          NOTES=""
+          for PR in $PR_NUMBERS; do
+            echo "Fetching PR #$PR …"
+            PR_JSON=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/$PR")
+            TITLE=$(echo "$PR_JSON" | jq -r '.title // empty')
+            BODY=$(echo "$PR_JSON" | jq -r '.body // empty')
+            AUTHOR=$(echo "$PR_JSON" | jq -r '.user.login // empty')
+            if [ -z "$TITLE" ]; then
+              echo "  (PR #$PR not found or inaccessible, skipping)"
+              continue
+            fi
+
+            # Strip only checklist / checkbox lines. Keep ordinary PR prose
+            # (including notes such as "This has been done using ai…").
+            CLEAN_BODY=$(printf '%s\n' "$BODY" | sed -E '
+              /^Checklist:/,/^$/d
+              /^\s*\*\s*\[[ xX]\]/d
+              /^\s*-\s*\[[ xX]\]/d
+            ' | sed -E '/^[[:space:]]*$/N;/^\n$/d')
+
+            NOTES="${NOTES}### ${TITLE} (#${PR})
+*by @${AUTHOR}*
+
+${CLEAN_BODY}
+
+---
+"
+          done
+
+          if [ -z "$NOTES" ]; then
+            NOTES="*(No linked PR bodies found for this version bump; see commit log below.)*"
+          fi
+
+          {
+            echo "body<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build commit log since previous version bump
+        if: steps.version_check.outputs.should_release == 'true' && steps.check_release.outputs.exists == 'false'
         id: changelog
         run: |
-          # We need master history again for the changelog
-          git checkout master
-          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -n "$LAST_TAG" ]; then
-            COMMITS=$(git log $LAST_TAG..HEAD --pretty=format:"- %s (%h)")
+          set -euo pipefail
+          GRADLE="src/all/kavita/build.gradle"
+          mapfile -t BUMP_COMMITS < <(git log --pretty=%H -- "$GRADLE")
+          PREV_BUMP="${BUMP_COMMITS[1]:-}"
+
+          if [ -n "$PREV_BUMP" ]; then
+            COMMITS=$(git log "${PREV_BUMP}..HEAD" --pretty=format:"- %s (%h)" || true)
           else
-            COMMITS=$(git log --pretty=format:"- %s (%h)" -n 20)
+            # Prefer last git tag if present; otherwise a short window.
+            LAST_TAG=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+            if [ -n "$LAST_TAG" ]; then
+              COMMITS=$(git log "${LAST_TAG}..HEAD" --pretty=format:"- %s (%h)" || true)
+            else
+              COMMITS=$(git log --pretty=format:"- %s (%h)" -n 30 || true)
+            fi
           fi
-          
           {
             echo "changelog<<EOF"
             echo "$COMMITS"
             echo "EOF"
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
-      # Switch back to 'repo' branch to upload the APK
-      - name: Final Switch to repo branch
-        if: steps.check_release.outputs.exists == 'false'
-        run: |
-          git checkout repo
-
-      - name: Create Release
-        if: steps.check_release.outputs.exists == 'false'
+      - name: Create GitHub Release
+        if: steps.version_check.outputs.should_release == 'true' && steps.check_release.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.apk_info.outputs.version }}
           tag_name: ${{ steps.apk_info.outputs.version }}
+          # Tag points at the repo branch (where the APK lives) so the asset matches the published index.
           target_commitish: repo
           body: |
             ## 🚀 Release ${{ steps.apk_info.outputs.version }}
-            
-            ${{ steps.pr_info.outputs.pr_body }}
-            
-            ---
-            
+
+            ${{ steps.notes.outputs.body }}
+
             <details>
-            <summary>📦 View Full Commit Log</summary>
-            
+            <summary>📦 Full commit log since previous version bump</summary>
+
             ${{ steps.changelog.outputs.changelog }}
             </details>
-            
+
             ---
-            🤖 *This release was automatically created*
+            🤖 *This release was automatically created on extVersionCode bump*
           files: ${{ steps.apk_info.outputs.apk_path }}
           draft: false
           prerelease: false
