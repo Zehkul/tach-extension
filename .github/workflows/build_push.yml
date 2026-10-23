@@ -104,7 +104,8 @@ jobs:
 
       - name: Upload APKs (${{ matrix.chunk.number }})
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: github.repository == 'Kareadita/tach-extension'
+        # Always upload when the build job runs (signing secrets are already required to reach this step).
+        # Allows forks to exercise the full publish + release pipeline for testing.
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: "**/*.apk"
@@ -140,7 +141,8 @@ jobs:
   publish:
     name: Publish extension repo
     needs: [prepare, build, unit-test]
-    if: github.repository == 'Kareadita/tach-extension'
+    # Official repo always. Forks: run when the workflow reached build (signing secrets present),
+    # so contributors can test the full repo-branch + release pipeline end-to-end.
     runs-on: 'ubuntu-24.04'
     steps:
       - name: Download APK artifacts
@@ -169,13 +171,28 @@ jobs:
           java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
           python ./.github/scripts/create-repo.py
 
-      - name: Checkout repo branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: Kareadita/tach-extension
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: repo
-          path: repo
+      - name: Checkout or create repo branch
+        run: |
+          set -euo pipefail
+          # Prefer existing repo branch; if the fork has never published, create an orphan one.
+          if git ls-remote --exit-code --heads "https://github.com/${{ github.repository }}.git" repo >/dev/null 2>&1; then
+            git clone --branch repo --single-branch \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" repo
+          else
+            echo "No 'repo' branch yet — creating orphan branch for first publish."
+            mkdir repo && cd repo
+            git init -b repo
+            git remote add origin \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            # Placeholder so the branch is non-empty; merge-repo.py will replace contents.
+            echo "# extension repo" > README.md
+            git add README.md
+            git commit -m "Initialize repo branch"
+            git push -u origin repo
+            cd ..
+          fi
 
       - name: Merge repo
         run: |
@@ -191,5 +208,7 @@ jobs:
           committer_email: github-actions[bot]@users.noreply.github.com
 
       - name: Purge cached index on jsDelivr
+        # Only meaningful for the official repo; harmless no-op / 404 on forks.
+        if: github.repository == 'Kareadita/tach-extension'
         run: |
           curl https://purge.jsdelivr.net/gh/Kareadita/tach-extension@repo/index.min.json
