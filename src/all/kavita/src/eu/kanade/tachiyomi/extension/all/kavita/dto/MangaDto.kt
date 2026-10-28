@@ -302,3 +302,14 @@ data class ReadingListItemDto(
     val libraryName: String?,
     @SerialName("readingListId") val readingListId: Int,
 )
+
+@Serializable
+data class ProgressDto(
+    val volumeId: Int,
+    val chapterId: Int,
+    val pageNum: Int,
+    val seriesId: Int,
+    val libraryId: Int,
+    val bookScrollId: String? = null,
+    val lastModifiedUtc: String? = null,
+)
