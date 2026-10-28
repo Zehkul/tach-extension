@@ -30,6 +30,7 @@ import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataLibrary
 import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataPeople
 import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataPubStatus
 import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataTag
+import eu.kanade.tachiyomi.extension.all.kavita.dto.ProgressDto
 import eu.kanade.tachiyomi.extension.all.kavita.dto.ReadingListDto
 import eu.kanade.tachiyomi.extension.all.kavita.dto.ReadingListItemDto
 import eu.kanade.tachiyomi.extension.all.kavita.dto.RelatedSeriesResponse
@@ -47,7 +48,9 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.source.ProgressAwareSource
 import eu.kanade.tachiyomi.source.UnmeteredSource
+import eu.kanade.tachiyomi.source.model.ChapterProgress
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.Filter.TriState.Companion.STATE_EXCLUDE
 import eu.kanade.tachiyomi.source.model.Filter.TriState.Companion.STATE_INCLUDE
@@ -69,9 +72,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import okhttp3.Dns
 import okhttp3.Headers
 import okhttp3.HttpUrl
@@ -97,7 +103,11 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlin.let
 import kotlin.runCatching
 
-class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSource, HttpSource() {
+class Kavita(private val suffix: String = "") :
+    ConfigurableSource,
+    UnmeteredSource,
+    HttpSource(),
+    ProgressAwareSource {
     private val helper = KavitaHelper()
 
     // Initialize the intl object
@@ -2852,4 +2862,304 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
         val expiredEntries = metadataCache.values.count { it.isExpired(CACHE_TTL) }
         return "Cache stats: $totalEntries total entries, $expiredEntries expired"
     }
+
+    /** seriesId → libraryId (for Reader/progress payloads). */
+    private val seriesLibraryCache = ConcurrentHashMap<Int, Int>()
+
+    /** chapterId → (volumeId, pages) so bulk pushes avoid repeated Chapter GETs. */
+    private val chapterMetaCache = ConcurrentHashMap<Int, Pair<Int, Int>>()
+
+    // ---- ProgressAwareSource ------------------------------------------------
+
+    override suspend fun updateProgress(
+        manga: SManga,
+        progress: List<ChapterProgress>,
+    ) {
+        if (progress.isEmpty()) return
+        val latest =
+            progress.groupBy { it.chapterUrl }.values.map { records ->
+                records.maxBy { it.pageIndex + if (it.completed) 1_000_000 else 0 }
+            }
+        val seriesId = helper.getIdFromUrl(manga.url)
+        val libraryId =
+            seriesLibraryCache[seriesId] ?: run {
+                val seriesDto =
+                    client
+                        .newCall(GET("$apiUrl/Series/$seriesId", headersBuilder().build()))
+                        .await()
+                        .also { if (!it.isSuccessful) throw IOException("Series HTTP ${it.code}") }
+                        .parseAs<SeriesDto>()
+                seriesLibraryCache[seriesId] = seriesDto.libraryId
+                seriesDto.libraryId
+            }
+
+        val toMarkRead = linkedSetOf<Int>()
+        val toMarkUnread = linkedSetOf<Int>()
+        val pageUpdates = mutableListOf<ChapterProgress>()
+        val failures = mutableListOf<Pair<String, Exception>>()
+
+        for (p in latest) {
+            val chapterId = parseChapterId(p.chapterUrl) ?: continue
+            val tocStart = parseTocStart(p.chapterUrl)
+            val isTocSlice = "tocStart=" in p.chapterUrl
+            try {
+                val meta =
+                    chapterMetaCache[chapterId] ?: run {
+                        val chapterDetails =
+                            client
+                                .newCall(GET("$apiUrl/Chapter?chapterId=$chapterId", headersBuilder().build()))
+                                .await()
+                                .also { if (!it.isSuccessful) throw IOException("Chapter HTTP ${it.code}") }
+                                .parseAs<ChapterDto>()
+                        (chapterDetails.volumeId to chapterDetails.pages).also {
+                            chapterMetaCache[chapterId] = it
+                        }
+                    }
+                val (volumeId, pages) = meta
+                val absolutePage = tocStart + p.pageIndex
+                val atChapterEnd = absolutePage >= (pages - 1).coerceAtLeast(0)
+
+                when {
+                    p.completed && (!isTocSlice || atChapterEnd) -> {
+                        // Full-chapter completed: batch mark-read; still set pageNum to last page.
+                        pageUpdates.add(p)
+                        toMarkRead.add(chapterId)
+                        toMarkUnread.remove(chapterId)
+                    }
+
+                    !p.completed && p.pageIndex == 0 && !isTocSlice -> {
+                        // Explicit unread / reset — batch mark-unread + page 0 progress.
+                        pageUpdates.add(p)
+                        toMarkUnread.add(chapterId)
+                        toMarkRead.remove(chapterId)
+                    }
+
+                    else -> {
+                        pageUpdates.add(p)
+                    }
+                }
+
+                // Ensure volumeId is available for the progress POST below.
+                if (volumeId < 0) error("invalid volume")
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.e(LOG_TAG, "Failed to prepare progress for chapter $chapterId", e)
+                failures.add(p.chapterUrl to e)
+            }
+        }
+
+        // Per-chapter page position (Kavita has no bulk progress endpoint).
+        for (p in pageUpdates) {
+            val chapterId = parseChapterId(p.chapterUrl) ?: continue
+            try {
+                val meta =
+                    chapterMetaCache[chapterId]
+                        ?: throw IOException("Missing chapter meta for $chapterId")
+                val tocStart = parseTocStart(p.chapterUrl)
+                val absolutePage = tocStart + p.pageIndex
+                val body =
+                    json
+                        .encodeToJsonElement(
+                            ProgressDto(
+                                volumeId = meta.first,
+                                chapterId = chapterId,
+                                pageNum = absolutePage,
+                                seriesId = seriesId,
+                                libraryId = libraryId,
+                            ),
+                        ).toString()
+                        .toRequestBody(JSON_MEDIA_TYPE)
+                val progressResp =
+                    client
+                        .newCall(POST("$apiUrl/Reader/progress", headersBuilder().build(), body))
+                        .await()
+                if (!progressResp.isSuccessful) {
+                    throw IOException("Progress HTTP ${progressResp.code}")
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.e(LOG_TAG, "Failed to push page progress for chapter $chapterId", e)
+                failures.add(p.chapterUrl to e)
+            }
+        }
+
+        // Bulk completed / unread flags — one request each for the whole series batch.
+        if (toMarkRead.isNotEmpty()) {
+            try {
+                val markBody =
+                    buildJsonObject {
+                        put("seriesId", seriesId)
+                        putJsonArray("chapterIds") {
+                            toMarkRead.forEach { add(JsonPrimitive(it)) }
+                        }
+                    }.toString().toRequestBody(JSON_MEDIA_TYPE)
+                val markResp =
+                    client
+                        .newCall(
+                            POST("$apiUrl/Reader/mark-multiple-read", headersBuilder().build(), markBody),
+                        ).await()
+                if (!markResp.isSuccessful) {
+                    // Fallback: per-chapter mark-read (older servers / body shape variants).
+                    Log.w(LOG_TAG, "mark-multiple-read HTTP ${markResp.code}; falling back")
+                    for (chapterId in toMarkRead) {
+                        val single =
+                            buildJsonObject {
+                                put("seriesId", seriesId)
+                                put("chapterId", chapterId)
+                            }.toString().toRequestBody(JSON_MEDIA_TYPE)
+                        val r =
+                            client
+                                .newCall(
+                                    POST("$apiUrl/Reader/mark-chapter-read", headersBuilder().build(), single),
+                                ).await()
+                        if (!r.isSuccessful) {
+                            failures.add("/Chapter/$chapterId" to IOException("mark-read HTTP ${r.code}"))
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                failures.add("mark-multiple-read" to e)
+            }
+        }
+        if (toMarkUnread.isNotEmpty()) {
+            try {
+                val markBody =
+                    buildJsonObject {
+                        put("seriesId", seriesId)
+                        putJsonArray("chapterIds") {
+                            toMarkUnread.forEach { add(JsonPrimitive(it)) }
+                        }
+                    }.toString().toRequestBody(JSON_MEDIA_TYPE)
+                val markResp =
+                    client
+                        .newCall(
+                            POST("$apiUrl/Reader/mark-multiple-unread", headersBuilder().build(), markBody),
+                        ).await()
+                if (!markResp.isSuccessful) {
+                    // No reliable single-chapter unread route; pageNum=0 progress above is enough.
+                    Log.w(LOG_TAG, "mark-multiple-unread HTTP ${markResp.code}")
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.w(LOG_TAG, "mark-multiple-unread failed", e)
+            }
+        }
+
+        if (failures.isNotEmpty()) {
+            throw IOException(
+                "Failed to push progress for ${failures.size} item(s): " +
+                    failures.first().second.message,
+            )
+        }
+    }
+
+    override suspend fun getProgress(
+        manga: SManga,
+        chapterUrls: List<String>,
+    ): List<ChapterProgress> {
+        if (chapterUrls.isEmpty()) return emptyList()
+        val result = mutableListOf<ChapterProgress>()
+        for (url in chapterUrls) {
+            val chapterId = parseChapterId(url) ?: continue
+            try {
+                val req = GET("$apiUrl/Reader/get-progress?chapterId=$chapterId", headersBuilder().build())
+                val response = client.newCall(req).await()
+                if (!response.isSuccessful) continue
+                val dto = response.parseAs<ProgressDto>()
+                val chapterReq = GET("$apiUrl/Chapter?chapterId=$chapterId", headersBuilder().build())
+                val chapterDetails = client.newCall(chapterReq).await().parseAs<ChapterDto>()
+                val tocStart = parseTocStart(url)
+                val tocEnd = parseTocEnd(url)
+                // Convert absolute Kavita page → relative index within a TOC slice
+                val relativePage = (dto.pageNum - tocStart).coerceAtLeast(0)
+                val pageCount =
+                    if (tocEnd != null) {
+                        (tocEnd - tocStart).coerceAtLeast(1)
+                    } else {
+                        chapterDetails.pages
+                    }
+                // Match snapshot: Kavita treats pagesRead/pageNum >= pages as completed.
+                // Using pages-1 made a 1-page chapter look completed when unread (pageNum 0).
+                val completed =
+                    if (tocEnd != null) {
+                        dto.pageNum >= tocEnd
+                    } else {
+                        chapterDetails.pages > 0 && dto.pageNum >= chapterDetails.pages
+                    }
+                result.add(
+                    ChapterProgress(
+                        chapterUrl = url,
+                        pageIndex = relativePage.coerceAtMost((pageCount - 1).coerceAtLeast(0)),
+                        pageCount = pageCount,
+                        completed = completed,
+                        readAt = 0L,
+                    ),
+                )
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.e(LOG_TAG, "Failed to pull progress for chapter $chapterId", e)
+            }
+        }
+        return result
+    }
+
+    override suspend fun getProgressSnapshot(manga: SManga): Map<String, ChapterProgress>? =
+        try {
+            val seriesId = helper.getIdFromUrl(manga.url)
+            val volumesReq = GET("$apiUrl/Series/volumes?seriesId=$seriesId", headersBuilder().build())
+            val volumes = client.newCall(volumesReq).await().parseAs<List<VolumeDto>>()
+            val map = mutableMapOf<String, ChapterProgress>()
+            for (volume in volumes) {
+                for (chapter in volume.chapters) {
+                    val url = "/Chapter/${chapter.id}"
+                    // pagesRead is the same 0-based page index as ProgressDto.pageNum
+                    // (get-progress). Do not subtract 1 — that caused snapshot=6 vs live=7.
+                    val lastIdx = (chapter.pages - 1).coerceAtLeast(0)
+                    val pageIndex = chapter.pagesRead.coerceIn(0, lastIdx)
+                    // pagesRead >= pages is Kavita's completed rule. Do not use
+                    // pageIndex >= lastIdx — for pages==1 that is true even when unread.
+                    val completed = chapter.pages > 0 && chapter.pagesRead >= chapter.pages
+                    // Always emit an entry, including page 0. Omitting page 0 made
+                    // pull-to-refresh treat "reset to first page" as missing progress
+                    // and left the higher local page in place.
+                    map[url] =
+                        ChapterProgress(
+                            chapterUrl = url,
+                            pageIndex = pageIndex,
+                            pageCount = chapter.pages,
+                            completed = completed,
+                            readAt = 0L,
+                        )
+                }
+            }
+            map
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Failed to build progress snapshot", e)
+            null
+        }
+
+    /** Extract numeric chapter id from SChapter.url forms used by this extension. */
+    private fun parseChapterId(url: String): Int? {
+        val raw =
+            url
+                .substringAfter("/Chapter/", missingDelimiterValue = url)
+                .substringBefore("?")
+                .substringBefore("_")
+                .trim()
+        return raw.toIntOrNull()
+    }
+
+    private fun parseTocStart(url: String): Int =
+        url
+            .substringAfter("tocStart=", missingDelimiterValue = "")
+            .substringBefore("&")
+            .toIntOrNull()
+            ?: 0
+
+    private fun parseTocEnd(url: String): Int? =
+        url
+            .substringAfter("tocEnd=", missingDelimiterValue = "")
+            .substringBefore("&")
+            .toIntOrNull()
 }
