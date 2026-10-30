@@ -15,8 +15,14 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  # One CI run per branch; do not cancel in-progress so publish to repo is not interrupted mid-push.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
 
 env:
   CI_CHUNK_SIZE: 65
@@ -104,7 +110,8 @@ jobs:
 
       - name: Upload APKs (${{ matrix.chunk.number }})
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: github.repository == 'Kareadita/tach-extension'
+        # Always upload when the build job runs (signing secrets are already required to reach this step).
+        # Allows forks to exercise the full publish + release pipeline for testing.
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: "**/*.apk"
@@ -140,7 +147,9 @@ jobs:
   publish:
     name: Publish extension repo
     needs: [prepare, build, unit-test]
-    if: github.repository == 'Kareadita/tach-extension'
+    # Push / manual dispatch only (not pull_request). Official repo and forks with
+    # signing secrets can exercise the full repo-branch pipeline end-to-end.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: 'ubuntu-24.04'
     steps:
       - name: Download APK artifacts
@@ -169,13 +178,49 @@ jobs:
           java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
           python ./.github/scripts/create-repo.py
 
-      - name: Checkout repo branch
+      - name: Ensure repo branch exists
+        id: repo_branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/branches/repo" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No 'repo' branch yet — will create an orphan branch after checkout attempt."
+          fi
+
+      - name: Checkout existing repo branch
+        if: steps.repo_branch.outputs.exists == 'true'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Kareadita/tach-extension
-          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
           ref: repo
           path: repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create orphan repo branch
+        if: steps.repo_branch.outputs.exists == 'false'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ github.repository }}
+          path: repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Initialize orphan repo branch
+        if: steps.repo_branch.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          cd repo
+          git checkout --orphan repo
+          git rm -rf . >/dev/null 2>&1 || true
+          echo "# extension repo" > README.md
+          git add README.md
+          git -c user.name="github-actions[bot]" \
+              -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -m "Initialize repo branch"
+          git push -u origin repo
 
       - name: Merge repo
         run: |
@@ -191,5 +236,7 @@ jobs:
           committer_email: github-actions[bot]@users.noreply.github.com
 
       - name: Purge cached index on jsDelivr
+        # Only meaningful for the official repo.
+        if: github.repository == 'Kareadita/tach-extension'
         run: |
           curl https://purge.jsdelivr.net/gh/Kareadita/tach-extension@repo/index.min.json
