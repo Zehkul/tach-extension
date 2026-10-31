@@ -251,6 +251,7 @@ data class ChapterDto(
     val volumeId: Int,
     val created: String,
     val lastModifiedUtc: String,
+    val lastReadingProgressUtc: String? = null,
     val releaseDate: String,
     val files: List<FileDto>? = null,
 ) {
@@ -301,4 +302,16 @@ data class ReadingListItemDto(
     val releaseDate: String? = null,
     val libraryName: String?,
     @SerialName("readingListId") val readingListId: Int,
+)
+
+@Serializable
+data class ProgressDto(
+    val volumeId: Int,
+    val chapterId: Int,
+    val pageNum: Int,
+    val seriesId: Int,
+    val libraryId: Int,
+    val bookScrollId: String? = null,
+    val lastModifiedUtc: String? = null,
+    val lastReadingProgressUtc: String? = null,
 )
