@@ -30,6 +30,7 @@ import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataLibrary
 import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataPeople
 import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataPubStatus
 import eu.kanade.tachiyomi.extension.all.kavita.dto.MetadataTag
+import eu.kanade.tachiyomi.extension.all.kavita.dto.ProgressDto
 import eu.kanade.tachiyomi.extension.all.kavita.dto.ReadingListDto
 import eu.kanade.tachiyomi.extension.all.kavita.dto.ReadingListItemDto
 import eu.kanade.tachiyomi.extension.all.kavita.dto.RelatedSeriesResponse
@@ -69,9 +70,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import okhttp3.Dns
 import okhttp3.Headers
 import okhttp3.HttpUrl
@@ -97,8 +101,11 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlin.let
 import kotlin.runCatching
 
-class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSource, HttpSource() {
-    private val helper = KavitaHelper()
+open class Kavita(private val suffix: String = "") :
+    ConfigurableSource,
+    UnmeteredSource,
+    HttpSource() {
+    protected val helper = KavitaHelper()
 
     // Initialize the intl object
     val intl = Intl(
@@ -135,14 +142,14 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
     override val name = "${KavitaInt.KAVITA_NAME} (${preferences.getString(KavitaConstants.customSourceNamePref, suffix)})"
     override val lang = "all"
     override val supportsLatest = true
-    private val apiUrl: String by lazy { getPrefApiUrl() }
+    protected val apiUrl: String by lazy { getPrefApiUrl() }
     private val apiKey: String by lazy { getPrefApiKey() }
     override val baseUrl by lazy { getPrefBaseUrl() }
     private val address by lazy { getPrefAddress() } // Address for the Kavita OPDS url. Should be http(s)://host:(port)/api/opds/api-key
     private var jwtToken = "" // * JWT Token for authentication with the server. Stored in memory.
-    private val LOG_TAG = """Kavita_${"[$suffix]_" + preferences.getString(KavitaConstants.customSourceNamePref, "[$suffix]")!!.replace(' ', '_')}"""
+    protected val LOG_TAG = """Kavita_${"[$suffix]_" + preferences.getString(KavitaConstants.customSourceNamePref, "[$suffix]")!!.replace(' ', '_')}"""
     private var isLogged = false // Used to know if login was correct and not send login requests anymore
-    private val json: Json by injectLazy()
+    protected val json: Json by injectLazy()
 
     // Act as a cache
     private var series = emptyList<SeriesDto>()
@@ -2537,7 +2544,7 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
 
     companion object {
         private const val ADDRESS_TITLE = "Address"
-        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
 
         private const val APIKEY = "APIKEY"
 
@@ -2852,4 +2859,34 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
         val expiredEntries = metadataCache.values.count { it.isExpired(CACHE_TTL) }
         return "Cache stats: $totalEntries total entries, $expiredEntries expired"
     }
+
+    /** seriesId → libraryId (for Reader/progress payloads). */
+    protected val seriesLibraryCache = ConcurrentHashMap<Int, Int>()
+
+    /** chapterId → (volumeId, pages) so bulk pushes avoid repeated Chapter GETs. */
+    protected val chapterMetaCache = ConcurrentHashMap<Int, Pair<Int, Int>>()
+
+    /** Extract numeric chapter id from SChapter.url forms used by this extension. */
+    protected fun parseChapterId(url: String): Int? {
+        val raw =
+            url
+                .substringAfter("/Chapter/", missingDelimiterValue = url)
+                .substringBefore("?")
+                .substringBefore("_")
+                .trim()
+        return raw.toIntOrNull()
+    }
+
+    protected fun parseTocStart(url: String): Int =
+        url
+            .substringAfter("tocStart=", missingDelimiterValue = "")
+            .substringBefore("&")
+            .toIntOrNull()
+            ?: 0
+
+    protected fun parseTocEnd(url: String): Int? =
+        url
+            .substringAfter("tocEnd=", missingDelimiterValue = "")
+            .substringBefore("&")
+            .toIntOrNull()
 }

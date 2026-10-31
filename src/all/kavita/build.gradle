@@ -13,5 +13,6 @@ dependencies {
 //    implementation(libs.lib.i18n)
     implementation project(':lib:i18n')
     implementation(libs.commons.text)
+    compileOnly project(':lib:progressaware')
 
 }
