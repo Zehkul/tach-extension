@@ -73,7 +73,6 @@ jobs:
         with:
           ref: ${{ steps.source.outputs.sha }}
           fetch-depth: 0
-          fetch-tags: true
           persist-credentials: false
 
       - name: Detect extVersionCode bump
