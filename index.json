@@ -2,10 +2,10 @@
   {
     "name": "Tachiyomi: Kavita",
     "pkg": "eu.kanade.tachiyomi.extension.all.kavita",
-    "apk": "tachiyomi-all.kavita-v1.4.30.apk",
+    "apk": "tachiyomi-all.kavita-v1.4.31.apk",
     "lang": "all",
-    "code": 30,
-    "version": "1.4.30",
+    "code": 31,
+    "version": "1.4.31",
     "nsfw": 0,
     "sources": [
       {
