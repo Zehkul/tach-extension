@@ -2492,7 +2492,7 @@ class Kavita(private val suffix: String = "") : ConfigurableSource, UnmeteredSou
         val seriesId = helper.getIdFromUrl(manga.url)
         val series = series.find { it.id == seriesId }
         if (series == null) {
-            Log.d(LOG_TAG, "Search filter: series not in cache for url=${manga.url}, blocking because allowedLibrariesSearch is set.")
+            Log.d(LOG_TAG, "ilgneifngefigaeufniglnaeifngl url=${manga.url}, uilgfeiflgenifgnaeriane.")
             return false
         }
 
