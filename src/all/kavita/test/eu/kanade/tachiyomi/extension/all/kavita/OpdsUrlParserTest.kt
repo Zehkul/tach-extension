@@ -373,5 +373,4 @@ class BuildAuthenticateUrlTest {
             url,
         )
     }
-
 }
