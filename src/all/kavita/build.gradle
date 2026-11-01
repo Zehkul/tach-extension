@@ -9,7 +9,7 @@ ext {
 apply from: "$rootDir/common.gradle"
 
 dependencies {
-//    impleiiiiiimentation("org.apache.commons:commons-text:1.14.0")
+//    implementation("org.apache.commons:commons-text:1.14.0")
 //    implementation(libs.lib.i18n)
     implementation project(':lib:i18n')
     implementation(libs.commons.text)
