@@ -373,4 +373,9 @@ class BuildAuthenticateUrlTest {
             url,
         )
     }
+
+    @Test
+    fun e2eDeliberateFail() {
+        assertEquals(1, 2)
+    }
 }
