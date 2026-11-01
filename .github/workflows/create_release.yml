@@ -189,7 +189,10 @@ jobs:
           find_apk() {
             local root="$1"
             [ -d "$root" ] || return 0
-            find "$root" -type f -name "tachiyomi-all.kavita-v*.${CODE}.apk" 2>/dev/null \
+            # CI artifacts keep the Gradle "-release" suffix; publish strips it.
+            find "$root" -type f \( \
+                -name "tachiyomi-all.kavita-v*.${CODE}.apk" -o \
+                -name "tachiyomi-all.kavita-v*.${CODE}-release.apk" \) 2>/dev/null \
               | sort -V \
               | tail -1 || true
           }
@@ -222,9 +225,16 @@ jobs:
             exit 1
           fi
 
+          # Normalize asset name: publish strips "-release"; match that on GitHub Releases.
+          ASSET_DIR="$RUNNER_TEMP/release-assets"
+          mkdir -p "$ASSET_DIR"
+          ASSET="$ASSET_DIR/tachiyomi-all.kavita-${VERSION}.apk"
+          cp "$APK_PATH" "$ASSET"
+
           echo "Found APK ($SOURCE): $APK_PATH"
+          echo "Release asset: $ASSET"
           echo "Release version tag: $VERSION"
-          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "apk_path=$ASSET" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
 
@@ -281,7 +291,7 @@ jobs:
                   *'(#'[0-9]*')'*) continue ;;
                 esac
                 set +e
-                ASSOC=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/pulls" 2>&1)
+                ASSOC=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/pulls" </dev/null 2>&1)
                 RC=$?
                 set -e
                 if [ "$RC" -ne 0 ]; then
@@ -289,7 +299,8 @@ jobs:
                   continue
                 fi
                 echo "$ASSOC" | jq -r '.[].number // empty' 2>/dev/null || true
-              done < <(git log --first-parent "$RANGE" --pretty=format:'%H %s' 2>/dev/null || true)
+              # tformat terminates the last line; format does not, so read skips it.
+              done < <(git log --first-parent "$RANGE" --pretty=tformat:'%H %s' 2>/dev/null || true)
             } | sort -n -u
           )
           echo "PR candidates in range: $(echo $PR_NUMBERS | tr '\n' ' ')"
@@ -337,7 +348,7 @@ jobs:
             echo "*(No linked PR bodies found for this version bump; see commit log below.)*" > "$NOTES_FILE"
           fi
 
-          COMMITS=$(git log --first-parent "$RANGE" --pretty=format:"- %s (%h)" || true)
+          COMMITS=$(git log --first-parent "$RANGE" --pretty=tformat:"- %s (%h)" || true)
 
           {
             echo ""
