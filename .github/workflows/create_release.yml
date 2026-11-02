@@ -257,7 +257,7 @@ jobs:
           if [ "$RC" -eq 0 ]; then
             echo "Release $VERSION already exists — skipping creation."
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          elif printf '%s\n' "$OUT" | grep -qiE 'could not resolve|not found|HTTP 404|Not Found'; then
+          elif printf '%s\n' "$OUT" | grep -qiE 'not found|HTTP 404|Not Found'; then
             echo "Release $VERSION does not exist."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
