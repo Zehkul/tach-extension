@@ -20,3 +20,5 @@ object KavitaConstants {
     const val allowedLibrariesFeedPref = "allowedLibrariesFeed"
     const val allowedLibrariesSearchPref = "allowedLibrariesSearch"
 }
+
+// smoke code 1793577875
